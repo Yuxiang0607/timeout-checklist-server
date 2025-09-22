@@ -5,3 +5,4 @@ soundfile
 ffmpeg-python
 python-multipart
 pydub
+pyaudioop
