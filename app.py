@@ -1,25 +1,17 @@
-# app.py — FastAPI + OpenAI STT + Embeddings（Render 可用｜方案A）
-import os, io, re, uuid
-from typing import Dict, List, Tuple
-from fastapi import FastAPI, UploadFile, Form
+# main.py
+import os, io, re, math
+from typing import List, Dict, Any
+from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 from openai import OpenAI
-from math import sqrt
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    print("⚠️  OPENAI_API_KEY is not set")
-
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ======= 方案A的模型與門檻 =======
+APP_TITLE = "Timeout-ComboA-API"
 STT_MODEL = "gpt-4o-transcribe"
 EMB_MODEL = "text-embedding-3-large"
-CANONICAL_THRESHOLD = 0.85
-TERMINATION_SENTENCE = "Timeout completed."
+CANONICAL_THRESHOLD = 0.80
 
-CANONICAL_SENTENCES = [
+CANONICAL_SENTENCES: List[str] = [
     "Is everyone ready to begin the timeout?",
     "Do we have the consent form in front of us?",
     "Please introduce yourselves.",
@@ -50,129 +42,117 @@ CANONICAL_SENTENCES = [
 
 DOMAIN_PROMPT = (
     "Transcribe in English only. This is an operating room timeout checklist. "
-    "Prefer complete sentences; avoid partial fragments. "
-    "If the spoken sentence is semantically equivalent to ANY of the following, "
-    "output EXACTLY that canonical sentence, word-for-word:\n\n"
+    "Each spoken sentence corresponds closely to one of the following lines. "
+    "Never output fragments; always transcribe until a full sentence is heard. "
+    "If uncertain, wait for more audio before finalizing.\n\n"
     + "\n".join(f"- {s}" for s in CANONICAL_SENTENCES)
 )
 
-# ======= FastAPI + CORS =======
-app = FastAPI()
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+SENT_END_PATTERN = re.compile(r'(.+?[\.!\?][\"\')\]]?\s+)')
+
+app = FastAPI(title=APP_TITLE)
+
+# CORS：本地測試與正式網域都可加入
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],   # 上線後建議改成你的網域
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ======= Session 狀態（記憶體；正式可換 Redis）=======
-class SessionState:
-    def __init__(self):
-        self.buffer = ""          # 滾動粗轉錄（用來切句）
-        self.printed = set()      # 已命中的標準句（避免重複）
-        self.ok_lines: List[str] = []  # 命中的標準句（匯出用）
+# --- OpenAI client ---
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing env OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-sessions: Dict[str, SessionState] = {}
+# --- Embeddings (cache) ---
+_canon_embeds: List[List[float]] = []
 
-# ======= Embeddings 工具 =======
-def embed_texts(texts: List[str]):
-    r = client.embeddings.create(model=EMB_MODEL, input=texts)
-    return [d.embedding for d in r.data]
+def _embed_texts(texts: List[str]) -> List[List[float]]:
+    resp = client.embeddings.create(model=EMB_MODEL, input=texts)
+    return [d.embedding for d in resp.data]
 
-def cosine_sim(a, b):
+def _ensure_canon_embeds():
+    global _canon_embeds
+    if not _canon_embeds:
+        _canon_embeds = _embed_texts(CANONICAL_SENTENCES)
+
+def _cosine(a: List[float], b: List[float]) -> float:
     dot = sum(x*y for x, y in zip(a, b))
-    na = sqrt(sum(x*x for x in a)); nb = sqrt(sum(y*y for y in b))
-    return 0.0 if na == 0 or nb == 0 else dot/(na*nb)
+    na = math.sqrt(sum(x*x for x in a))
+    nb = math.sqrt(sum(y*y for y in b))
+    if na == 0 or nb == 0: return 0.0
+    return dot / (na * nb)
 
-# 啟動時把 canonical embeddings 先算好（冷啟動一次）
-CANON_EMB = embed_texts(CANONICAL_SENTENCES)
-
-def best_match(sentence: str) -> Tuple[str, float]:
-    """對一句粗轉錄做語意比對，回 (最佳標準句, 相似度)"""
-    q = embed_texts([sentence])[0]
-    best_i, best_s = -1, -1.0
-    for i, c in enumerate(CANON_EMB):
-        s = cosine_sim(q, c)
-        if s > best_s:
-            best_i, best_s = i, s
-    return CANONICAL_SENTENCES[best_i], best_s
-
-# ======= 句界（. ? ! 後允許引號/括號）=======
-SENT_END = re.compile(r'(.+?[\.!\?][\"\')\]]?\s+)')
-
-def take_sentences(state: SessionState, new_text: str) -> List[str]:
-    outs = []
-    state.buffer = (state.buffer + " " + new_text.strip()).strip() if new_text else state.buffer
+def _segment_sentences(text: str) -> List[str]:
+    outs, buf = [], text.strip()
     while True:
-        m = SENT_END.match(state.buffer)
+        m = SENT_END_PATTERN.match(buf)
         if not m: break
-        sent = m.group(1).strip()
-        outs.append(sent)
-        state.buffer = state.buffer[len(m.group(1)):]
-    if len(state.buffer) > 1000:
-        state.buffer = state.buffer[-1000:]
+        s = m.group(1).strip()
+        outs.append(s)
+        buf = buf[len(m.group(1)):]
+    # 片段太短就忽略，避免半句
+    outs = [s for s in outs if len(s.split()) >= 4]
     return outs
 
-# ======= Routes =======
-@app.get("/")
-def root():
-    return {"ok": True, "service": "timeout-checklist-server", "mode": "ComboA"}
+class ChunkResponse(BaseModel):
+    hits: List[str]            # 命中的 canonical 句子（去重由前端做）
+    raw: List[str]             # STT 切出的完整句（過濾掉太短）
+    suggestions: List[Dict[str, Any]]  # 失敗時的建議：{raw, best, score}
 
-@app.post("/start")
-def start_session():
-    sid = str(uuid.uuid4())
-    sessions[sid] = SessionState()
-    return {"session_id": sid}
+@app.get("/health")
+def health():
+    return {"ok": True, "model": STT_MODEL, "emb": EMB_MODEL}
 
-@app.post("/chunk")
-async def process_chunk(session_id: str = Form(...), audio: UploadFile = Form(...)):
-    """前端每 2.5s 丟一段 audio/webm；回本次新命中的標準句（hits），以及是否終止。"""
-    st = sessions.get(session_id)
-    if not st:
-        return JSONResponse({"error": "invalid session"}, status_code=400)
+@app.get("/canon")
+def canon():
+    return {"sentences": CANONICAL_SENTENCES}
 
-    data = await audio.read()
-    if not data or len(data) < 600:
-        return {"hits": [], "terminate": False, "warn": "empty-or-too-small"}
+@app.post("/transcribe-chunk", response_model=ChunkResponse)
+async def transcribe_chunk(audio: UploadFile = File(...)):
+    if audio.content_type is None:
+        raise HTTPException(status_code=400, detail="audio file required")
+    # 讀 bytes，OpenAI STT 可接受 webm/wav/ogg 等
+    content = await audio.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=400, detail="empty audio")
 
-    # 丟給 STT（OpenAI 支援 webm/opus，無需轉檔）
-    bio = io.BytesIO(data); bio.name = audio.filename or "chunk.webm"
-    try:
-        r = client.audio.transcriptions.create(
-            model=STT_MODEL, file=bio, language="en", temperature=0, prompt=DOMAIN_PROMPT
+    # 1) 語音轉文字（粗轉錄）
+    with io.BytesIO(content) as f:
+        f.name = audio.filename or "chunk.webm"
+        stt = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=f,
+            temperature=0,
+            language="en",
+            prompt=DOMAIN_PROMPT
         )
-        rough = (r.text or "").strip()
-    except Exception as e:
-        # 避免 500，回 200 + error，前端不中斷
-        return {"hits": [], "terminate": False, "error": str(e)}
+    rough = (stt.text or "").strip()
+    if not rough:
+        return {"hits": [], "raw": [], "suggestions": []}
 
-    hits = []
-    if rough:
-        # 切句 → 過短句先跳過（多半是碎片）
-        for s in take_sentences(st, rough):
-            if len(s.split()) < 4:
-                continue
-            best, score = best_match(s.lower().replace("  ", " "))
-            if score >= CANONICAL_THRESHOLD and best not in st.printed:
-                st.printed.add(best)
-                st.ok_lines.append(best)
-                hits.append({"sentence": best, "score": round(score, 2)})
+    # 2) 本地斷句
+    sents = _segment_sentences(rough)
+    if not sents:
+        return {"hits": [], "raw": [], "suggestions": []}
 
-    terminate = (TERMINATION_SENTENCE in st.printed)
-    return {"hits": hits, "terminate": terminate}
+    # 3) Embeddings 對映
+    _ensure_canon_embeds()
+    q_embs = _embed_texts(sents)
+    hits, suggestions = [], []
+    for s, q in zip(sents, q_embs):
+        # 直接比對所有 canonical，找最高分
+        best_idx, best_score = -1, -1.0
+        for i, c in enumerate(_canon_embeds):
+            sim = _cosine(q, c)
+            if sim > best_score:
+                best_idx, best_score = i, sim
+        if best_score >= CANONICAL_THRESHOLD:
+            hits.append(CANONICAL_SENTENCES[best_idx])
+        else:
+            suggestions.append({"raw": s, "best": CANONICAL_SENTENCES[best_idx], "score": round(best_score, 2)})
 
-@app.get("/export/{session_id}")
-def export_text(session_id: str):
-    st = sessions.get(session_id)
-    if not st:
-        return JSONResponse({"error": "invalid session"}, status_code=400)
-    text = "\n".join(st.ok_lines) + ("\n" if st.ok_lines else "")
-    return PlainTextResponse(text, media_type="text/plain; charset=utf-8")
-
-@app.post("/reset")
-def reset_session(session_id: str = Form(...)):
-    if session_id in sessions:
-        del sessions[session_id]
-    return {"ok": True}
+    return {"hits": hits, "raw": sents, "suggestions": suggestions}
