@@ -1,7 +1,6 @@
 fastapi
-uvicorn[standard]
+uvicorn
 openai
-soundfile
-ffmpeg-python
 python-multipart
-pydub
+soundfile
+numpy
