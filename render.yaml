@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: timeout-comboa-api
+    name: timeout-checklist-server
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: OPENAI_API_KEY
-        sync: false   # 在 Render 儀表板上填入值
+        sync: false   # 到 Render 的 Environment 頁面填入你的金鑰
