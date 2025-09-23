@@ -1,7 +1,7 @@
 # app.py
 import os, io, re, math
-from typing import List, Dict, Any
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from typing import List
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -117,22 +117,56 @@ def health():
 def canon():
     return {"sentences": CANONICAL_SENTENCES}
 
+def _guess_filename(upload: UploadFile) -> str:
+    """根據 content_type/filename 補上合理的副檔名，避免 OpenAI 報 unsupported。"""
+    ct = (upload.content_type or "").lower()
+    # 如果前端已提供帶副檔名的檔名，就直接用
+    if upload.filename and "." in upload.filename:
+        return upload.filename
+    # 否則依 content_type 猜
+    if "mp4" in ct:
+        return "chunk.mp4"
+    if "webm" in ct:
+        return "chunk.webm"
+    if "wav" in ct or "x-wav" in ct:
+        return "chunk.wav"
+    if "ogg" in ct or "opus" in ct:
+        return "chunk.ogg"
+    # 不確定時預設 webm
+    return "chunk.webm"
+
 @app.post("/transcribe-chunk", response_model=ChunkResp)
-async def transcribe_chunk(audio: UploadFile = File(...)):
+async def transcribe_chunk(audio: UploadFile = File(...), request: Request = None):
     content = await audio.read()
     if not content:
         raise HTTPException(status_code=400, detail="empty audio")
 
-    # 1) STT
-    with io.BytesIO(content) as f:
-        f.name = audio.filename or "chunk.webm"
-        r = client.audio.transcriptions.create(
-            model=STT_MODEL,
-            file=f,
-            temperature=0,
-            language="en",
-            prompt=DOMAIN_PROMPT
-        )
+    # 調試用日誌（在 Render Logs 看）
+    try:
+        ip = request.client.host if request else "unknown"
+    except Exception:
+        ip = "unknown"
+    print(f"[chunk] from {ip} ct={audio.content_type} size={len(content)} name={audio.filename}")
+
+    # 依 content_type/filename 決定一個保險檔名
+    fname = _guess_filename(audio)
+
+    # 1) STT（加上 try/except，把 OpenAI 400 改成 400 回前端）
+    try:
+        with io.BytesIO(content) as f:
+            f.name = fname
+            r = client.audio.transcriptions.create(
+                model=STT_MODEL,
+                file=f,
+                temperature=0,
+                language="en",
+                prompt=DOMAIN_PROMPT
+            )
+    except Exception as e:
+        msg = getattr(e, "message", str(e))
+        print(f"[stt-error] {msg}")
+        raise HTTPException(status_code=400, detail=f"OpenAI STT error: {msg}")
+
     rough = (r.text or "").strip()
     if not rough:
         return {"hits": [], "raw": [], "suggestions": []}
