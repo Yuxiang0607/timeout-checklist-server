@@ -1,3 +1,4 @@
+# app.py
 import os, io, re, math
 from typing import List, Dict, Any
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -99,6 +100,14 @@ class ChunkResp(BaseModel):
     hits: list[str]
     raw: list[str]
     suggestions: list[dict]
+
+# ====== 路由 ======
+@app.get("/")
+def root():
+    return {
+        "message": "Timeout Checklist Server is running.",
+        "try": ["/health", "/canon", "POST /transcribe-chunk"]
+    }
 
 @app.get("/health")
 def health():
