@@ -15,7 +15,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 CANONICAL_SENTENCES = [
     "Is everyone ready to begin the timeout?",
-    "Do we have the consent for in front of us?",
+    "Do we have the consent form in front of us?",
     "Please introduce yourselves.",
     "Is the attending physician present?",
     "Who is the anesthesia attending?",
@@ -185,6 +185,7 @@ def get_transcript(name: str):
     if not os.path.isfile(path):
         raise HTTPException(404, "Not found")
     return FileResponse(path, media_type="text/plain", filename=name)
+
 
 
 
