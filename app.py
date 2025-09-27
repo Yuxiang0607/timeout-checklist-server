@@ -1,17 +1,19 @@
-# app.py
-import os, io, re, math
-from typing import List
-from fastapi import FastAPI, File, UploadFile, HTTPException, Request
+import io, os, time, math, re, uuid
+from typing import List, Dict
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse, FileResponse
 from openai import OpenAI
 
-# ===== 設定 =====
+# ====== 配置 ======
+API_KEY = os.environ.get("OPENAI_API_KEY")  # 在 Render Dashboard 設定環境變數
 STT_MODEL = "gpt-4o-transcribe"
 EMB_MODEL = "text-embedding-3-large"
 CANONICAL_THRESHOLD = 0.80
+SAVE_DIR = "transcripts"
+os.makedirs(SAVE_DIR, exist_ok=True)
 
-CANONICAL_SENTENCES: List[str] = [
+CANONICAL_SENTENCES = [
     "Is everyone ready to begin the timeout?",
     "Do we have the consent form in front of us?",
     "Please introduce yourselves.",
@@ -42,153 +44,127 @@ CANONICAL_SENTENCES: List[str] = [
 
 DOMAIN_PROMPT = (
     "Transcribe in English only. This is an operating room timeout checklist. "
-    "Each spoken sentence corresponds closely to one of the following lines. "
-    "Never output fragments; always transcribe until a full sentence is heard. "
-    "If uncertain, wait for more audio before finalizing.\n\n"
-    + "\n".join(f"- {s}" for s in CANONICAL_SENTENCES)
+    "Each spoken sentence closely matches one of the following lines. "
+    "Prefer outputting the exact canonical sentence when possible; avoid partials; "
+    "wait for the full sentence before finalizing.\n\n" +
+    "\n".join(f"- {s}" for s in CANONICAL_SENTENCES)
 )
 
-SENT_END_PATTERN = re.compile(r'(.+?[\.!\?][\"\')\]]?\s+)')
+client = OpenAI(api_key=API_KEY)
 
-# ===== FastAPI & CORS =====
-app = FastAPI(title="Timeout-ComboA-API")
+app = FastAPI(title="OR Timeout STT")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],        # 上線後建議改成你的前端網域
+    allow_origins=["*"],  # 部署後可改成你的前端網域
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===== OpenAI Client =====
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("Missing env OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    r = client.embeddings.create(model=EMB_MODEL, input=texts)
+    return [d.embedding for d in r.data]
 
-# ===== Embeddings Cache =====
-_canon_embeds: List[List[float]] = []
-
-def _embed_texts(texts: List[str]) -> List[List[float]]:
-    resp = client.embeddings.create(model=EMB_MODEL, input=texts)
-    return [d.embedding for d in resp.data]
-
-def _ensure_canon_embeds():
-    global _canon_embeds
-    if not _canon_embeds:
-        _canon_embeds = _embed_texts(CANONICAL_SENTENCES)
-
-def _cos(a: List[float], b: List[float]) -> float:
-    dot = sum(x*y for x, y in zip(a, b))
-    na = math.sqrt(sum(x*x for x in a))
-    nb = math.sqrt(sum(y*y for y in b))
+def cosine_sim(a, b) -> float:
+    dot = sum(x*y for x,y in zip(a,b))
+    na = math.sqrt(sum(x*x for x in a)); nb = math.sqrt(sum(y*y for y in b))
     if na == 0 or nb == 0: return 0.0
-    return dot/(na*nb)
+    return dot / (na*nb)
 
-def _segment_sentences(text: str) -> List[str]:
+# 預先算 canonical embeddings（啟動時）
+CANONICAL_EMB = embed_texts(CANONICAL_SENTENCES)
+
+SENT_END_PATTERN = re.compile(r'(.+?[\.!\?][\"\')\]]?\s+)')
+
+def split_sentences(text: str) -> List[str]:
     outs, buf = [], text.strip()
     while True:
         m = SENT_END_PATTERN.match(buf)
         if not m: break
-        s = m.group(1).strip()
-        outs.append(s)
+        sent = m.group(1).strip()
+        outs.append(sent)
         buf = buf[len(m.group(1)):]
-    # 過短片段忽略，避免半句
-    return [s for s in outs if len(s.split()) >= 4]
+    if buf.strip():
+        outs.append(buf.strip())
+    return outs
 
-class ChunkResp(BaseModel):
-    hits: list[str]
-    raw: list[str]
-    suggestions: list[dict]
-
-# ====== 路由 ======
-@app.get("/")
-def root():
-    return {
-        "message": "Timeout Checklist Server is running.",
-        "try": ["/health", "/canon", "POST /transcribe-chunk"]
-    }
+def best_match(sentence: str):
+    q = embed_texts([sentence])[0]
+    best_i, best_s = -1, -1.0
+    for i, c in enumerate(CANONICAL_EMB):
+        s = cosine_sim(q, c)
+        if s > best_s:
+            best_i, best_s = i, s
+    return CANONICAL_SENTENCES[best_i], float(best_s)
 
 @app.get("/health")
 def health():
-    return {"ok": True, "model": STT_MODEL, "emb": EMB_MODEL}
+    return {"ok": True}
 
-@app.get("/canon")
-def canon():
-    return {"sentences": CANONICAL_SENTENCES}
+@app.post("/upload-audio")
+async def upload_audio(file: UploadFile = File(...)):
+    """
+    接收前端錄音（webm/ogg/wav/m4a/mp3…），丟給 OpenAI STT。
+    回傳：
+      - matched: 命中的 canonical 清單（去重、保持首次出現順序）
+      - coverage: {canonical_sentence: true/false}
+      - transcript_url: 純淨稿（只含命中句）的 txt 下載位址
+      - raw_text: STT 原文（除錯用）
+    """
+    if not API_KEY:
+        raise HTTPException(500, "Missing OPENAI_API_KEY")
 
-def _guess_filename(upload: UploadFile) -> str:
-    """根據 content_type/filename 補上合理的副檔名，避免 OpenAI 報 unsupported。"""
-    ct = (upload.content_type or "").lower()
-    # 如果前端已提供帶副檔名的檔名，就直接用
-    if upload.filename and "." in upload.filename:
-        return upload.filename
-    # 否則依 content_type 猜
-    if "mp4" in ct:
-        return "chunk.mp4"
-    if "webm" in ct:
-        return "chunk.webm"
-    if "wav" in ct or "x-wav" in ct:
-        return "chunk.wav"
-    if "ogg" in ct or "opus" in ct:
-        return "chunk.ogg"
-    # 不確定時預設 webm
-    return "chunk.webm"
-
-@app.post("/transcribe-chunk", response_model=ChunkResp)
-async def transcribe_chunk(audio: UploadFile = File(...), request: Request = None):
-    content = await audio.read()
+    content = await file.read()
     if not content:
-        raise HTTPException(status_code=400, detail="empty audio")
+        raise HTTPException(400, "Empty file")
 
-    # 調試用日誌（在 Render Logs 看）
+    # 直接把 WebM/OGG/WAV bytes 丟給 STT；OpenAI 會自動解碼
     try:
-        ip = request.client.host if request else "unknown"
-    except Exception:
-        ip = "unknown"
-    print(f"[chunk] from {ip} ct={audio.content_type} size={len(content)} name={audio.filename}")
-
-    # 依 content_type/filename 決定一個保險檔名
-    fname = _guess_filename(audio)
-
-    # 1) STT（加上 try/except，把 OpenAI 400 改成 400 回前端）
-    try:
-        with io.BytesIO(content) as f:
-            f.name = fname
-            r = client.audio.transcriptions.create(
-                model=STT_MODEL,
-                file=f,
-                temperature=0,
-                language="en",
-                prompt=DOMAIN_PROMPT
-            )
+        f = io.BytesIO(content); f.name = file.filename or "audio.webm"
+        r = client.audio.transcriptions.create(
+            model=STT_MODEL,
+            file=f,
+            temperature=0,
+            language="en",
+            prompt=DOMAIN_PROMPT
+        )
+        rough_text = (r.text or "").strip()
     except Exception as e:
-        msg = getattr(e, "message", str(e))
-        print(f"[stt-error] {msg}")
-        raise HTTPException(status_code=400, detail=f"OpenAI STT error: {msg}")
+        raise HTTPException(500, f"STT error: {e}")
 
-    rough = (r.text or "").strip()
-    if not rough:
-        return {"hits": [], "raw": [], "suggestions": []}
+    # 句界切分 + 映射到 canonical
+    printed, ok_lines = set(), []
+    coverage = {s: False for s in CANONICAL_SENTENCES}
 
-    # 2) 斷句
-    sents = _segment_sentences(rough)
-    if not sents:
-        return {"hits": [], "raw": [], "suggestions": []}
-
-    # 3) Embeddings 對映
-    _ensure_canon_embeds()
-    q_embs = _embed_texts(sents)
-    hits, suggestions = [], []
-    for s, q in zip(sents, q_embs):
-        best_idx, best_score = -1, -1.0
-        for i, c in enumerate(_canon_embeds):
-            sim = _cos(q, c)
-            if sim > best_score:
-                best_idx, best_score = i, sim
-        if best_score >= CANONICAL_THRESHOLD:
-            hits.append(CANONICAL_SENTENCES[best_idx])
+    for s in split_sentences(rough_text):
+        # 已與 canonical 完全相同直接接受
+        if s in CANONICAL_SENTENCES:
+            cand, score, matched = s, 1.0, True
         else:
-            suggestions.append({"raw": s, "best": CANONICAL_SENTENCES[best_idx], "score": round(best_score, 2)})
+            cand, score = best_match(s)
+            matched = (score >= CANONICAL_THRESHOLD)
 
-    return {"hits": hits, "raw": sents, "suggestions": suggestions}
+        if matched and (cand not in printed):
+            printed.add(cand)
+            ok_lines.append(cand)
+            coverage[cand] = True
+
+    # 儲存純淨稿 txt
+    uid = uuid.uuid4().hex[:12]
+    txt_path = os.path.join(SAVE_DIR, f"{uid}.txt")
+    with open(txt_path, "w", encoding="utf-8") as w:
+        w.write("\n".join(ok_lines) + "\n")
+
+    return JSONResponse({
+        "matched": ok_lines,
+        "coverage": coverage,
+        "transcript_url": f"/transcript/{uid}.txt",
+        "raw_text": rough_text
+    })
+
+@app.get("/transcript/{name}")
+def get_transcript(name: str):
+    path = os.path.join(SAVE_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="text/plain", filename=name)
