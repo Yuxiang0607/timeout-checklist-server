@@ -44,11 +44,12 @@ CANONICAL_SENTENCES = [
 
 DOMAIN_PROMPT = (
     "Transcribe in English only. This is an operating room timeout checklist. "
-    "Each spoken sentence closely matches one of the following lines. "
-    "Prefer outputting the exact canonical sentence when possible; avoid partials; "
-    "wait for the full sentence before finalizing.\n\n" +
-    "\n".join(f"- {s}" for s in CANONICAL_SENTENCES)
+    "Each spoken sentence may match one of the lines below.\n"
+    "Do NOT guess or infer. If no clear speech is present, return exactly: [NO_SPEECH]. "
+    "If the speech is not clearly one of the lines, transcribe literally; do not normalize.\n\n"
+    + "\n".join(f"- {s}" for s in CANONICAL_SENTENCES)
 )
+
 
 client = OpenAI(api_key=API_KEY)
 
@@ -131,6 +132,22 @@ async def upload_audio(file: UploadFile = File(...)):
         rough_text = (r.text or "").strip()
     except Exception as e:
         raise HTTPException(500, f"STT error: {e}")
+
+    # === 低資訊保護：太短或沒有關鍵詞就直接視為沒有命中 ===
+    MIN_WORDS = 3
+    KEYWORDS = {"timeout","consent","introduce","attending","anesthesia",
+                "name","birth","record","signed","surgery","block","side",
+                "marked","local","concentration","volume","anticoagulants",
+                "clotting","allergies","neuropathy","nibp","ecg","spo2","etco2",
+                "question","concern","completed"}
+    words = rough_text.lower().split()
+    if len(words) < MIN_WORDS or not (set(words) & KEYWORDS):
+        return JSONResponse({
+            "matched": [],
+            "coverage": {s: False for s in CANONICAL_SENTENCES},
+            "transcript_url": None,
+            "raw_text": rough_text
+        })
 
     # 句界切分 + 映射到 canonical
     printed, ok_lines = set(), []
