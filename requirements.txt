@@ -1,5 +1,7 @@
-fastapi==0.112.2
-uvicorn[standard]==0.30.6
-openai>=1.40.0
-python-multipart==0.0.9
+fastapi
+uvicorn[standard]
+openai
+soundfile
+ffmpeg-python
+python-multipart
 pydub
