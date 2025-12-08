@@ -7,7 +7,7 @@ from openai import OpenAI
 
 # ====== 配置 ======
 API_KEY = os.environ.get("OPENAI_API_KEY")  # 在 Render Dashboard 設定環境變數
-STT_MODEL = "gpt-4o-transcribe"
+STT_MODEL = "gpt-4o-mini-transcribe"
 EMB_MODEL = "text-embedding-3-large"
 CANONICAL_THRESHOLD = 0.80
 SAVE_DIR = "transcripts"
@@ -185,6 +185,7 @@ def get_transcript(name: str):
     if not os.path.isfile(path):
         raise HTTPException(404, "Not found")
     return FileResponse(path, media_type="text/plain", filename=name)
+
 
 
 
