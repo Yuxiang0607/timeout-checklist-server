@@ -9,7 +9,7 @@ from openai import OpenAI
 
 # ===== 基本設定 =====
 APP_TITLE = "Timeout-ComboA-API (WAV conversion)"
-STT_MODEL = "gpt-4o-mini-transcribe"           # or  gpt-4o-transcribe
+STT_MODEL = "gpt-4o-transcribe"           # or  gpt-4o-transcribe
 EMB_MODEL = "text-embedding-3-large"
 CANONICAL_THRESHOLD = 0.80
 
